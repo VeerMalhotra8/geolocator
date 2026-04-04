@@ -1,10 +1,10 @@
-# GeoLocator: AI-Powered Image Geolocation
+# GeoLocator — Image Geolocation with CLIP + DoRA
 
-A deep learning system that predicts the geographic location of a photo using only visual cues — no GPS metadata, no EXIF data, just pixels.
+Predicts where a photo was taken from pixels alone — no GPS, no EXIF, just the image.
 
-Built on CLIP ViT-L/14 with DoRA fine-tuning, semantic geocell classification, and two-stage FAISS retrieval refinement. Trained on 50K street-view images from [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m), with a scaling path to 1M+.
+Uses CLIP ViT-L/14 with DoRA adapters and semantic geocell classification. Trained on 50K street-view images from [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m), scaling to 1M next.
 
-**Current best (50K, Im2GPS3k benchmark): 672 km median error**
+**50K Im2GPS3k benchmark: 672 km median error**
 
 ---
 
@@ -22,18 +22,54 @@ Built on CLIP ViT-L/14 with DoRA fine-tuning, semantic geocell classification, a
 
 *StreetCLIP doesn't report median directly; estimated from their % @ km curve.
 
-With **20x less training data**, GeoLocator already achieves a lower median error than StreetCLIP. At 1M images, projections put us ahead on every threshold.
+With 20x less training data, GeoLocator already beats StreetCLIP on median error. 1M should close the gap on the threshold metrics too.
 
-### Training Progression (50K prototype)
+### Training Progression (50K)
 
 | Phase | Approach | Val Median | < 25km | < 200km |
 |-------|----------|:---:|:---:|:---:|
 | Contrastive pretraining | DoRA + InfoNCE | 891 km (Geo-NN) | — | — |
 | S2 cell classification | 8,970 uniform cells | 174 km | 15.3% | 53.1% |
 | Semantic geocells | 539 OPTICS clusters | 130 km | 25.8% | 58.8% |
-| + FAISS refinement | k-NN within top cells | 605 km* | 11.3%* | 23.1%* |
 
-*Im2GPS3k external benchmark. Internal val metrics are inflated 2-5x due to spatial leakage in the 50K split — see [Lessons Learned](#lessons-learned).
+Internal val metrics are inflated ~5x due to spatial leakage (38% of val images had a train neighbor <1km). Im2GPS3k is the honest benchmark — see [Challenges](#challenges).
+
+### Ablation Study (50K, Im2GPS3k)
+
+Tested modifications before committing to the 1M run:
+
+**Geocell / tau ablations:**
+
+| Config | Im2GPS3k Median | <25km | <200km | <750km | <2500km | Verdict |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|
+| Baseline (539 cells, tau=200) | 672 km | 11.3% | 23.2% | 52.5% | 77.6% | — |
+| tau=100 only (539 cells) | 674 km | 12.2% | 24.0% | 52.2% | 77.0% | no change |
+| **1424 cells + tau=100** | **617 km** | **13.1%** | **26.3%** | **55.2%** | **78.1%** | **-8.2%, best** |
+| Hierarchical continent mask | 673 km | 11.3% | 23.2% | 52.5% | 77.6% | useless, dropped |
+| MixUp (beta=0.1) | — | — | — | — | — | never ran |
+
+More geocells + lower tau was the clear winner. Tau alone does nothing — they're coupled. Continent masking was a waste — the geo head already concentrates probability on the right continent. MixUp was planned but we moved on to 1M.
+
+**FAISS inference methods (no retraining, post-hoc):**
+
+| Method | Median km | <25km | <200km | <750km | <2500km |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| Top-1 coarse (baseline) | 672 km | **11.3%** | **23.1%** | 52.8% | **77.6%** |
+| Weighted coarse | 783 km | 0.7% | 17.2% | 48.7% | 75.7% |
+| k-NN raw (gr=1000km) | **605 km** | 2.0% | 21.4% | **55.2%** | 75.0% |
+| Gated (conf=0.6, gr=1000km) | 613 km | 3.0% | 21.8% | 54.9% | 75.2% |
+
+k-NN improved median by 10% but destroyed city-level accuracy (<25km: 11.3% → 2.0%). Weighted coarse was strictly worse than top-1 everywhere. Fundamental tradeoff — neighbor averaging helps coarse, hurts fine. Deferred to 5M where density might actually help.
+
+**TTA (test-time augmentation, 3 views):**
+
+| Metric | Top-1 | TTA | Delta |
+|--------|:---:|:---:|:---:|
+| Median | 672 km | 666 km | -0.9% |
+| <200km | 23.4% | 24.3% | +0.9pp |
+| <750km | 52.8% | 53.3% | +0.5pp |
+
+Marginal at 50K. Should scale better with more data.
 
 ---
 
@@ -62,61 +98,49 @@ CLIP ViT-L/14 (frozen, 428M params)
               UN Region (16)       weight=0.3
 ```
 
-### Key Design Decisions
+### Why these choices
 
-**Why DoRA over LoRA?** Weight-decomposed adaptation provides better out-of-distribution generalization — critical for geolocation where train images (street view) differ from test images (tourist photos, CCTV, etc.).
+**DoRA over LoRA** — Weight-decomposed adaptation handles OOD better. Geolocation needs extreme OOD generalization (train on street view, test on tourist photos).
 
-**Why semantic geocells over S2 cells?** Uniform S2 partitioning creates 8,970 cells with extreme imbalance (39% have only 1 image). OPTICS clustering on training GPS coordinates produces 539 semantically meaningful cells (min 21, median 81 images/cell) that respect geographic density.
+**Semantic geocells over S2 cells** — Uniform S2 gives 8,970 cells where 39% have a single image. OPTICS clustering produces 539 cells (min 21, median 81 images/cell) that actually respect where data is dense.
 
-**Why haversine label smoothing?** Hard cell labels ignore geography — predicting a neighboring cell should be "almost right," not completely wrong. Soft targets with tau=200km give partial credit for nearby predictions, producing smoother gradients and better calibrated confidence.
-
-**Why two-stage retrieval?** Coarse cell classification gets you to the right region. FAISS k-NN search within the predicted cell's training images refines to a specific coordinate. This improved median error from 672 km to 605 km on Im2GPS3k.
+**Haversine label smoothing** — Predicting a neighboring cell should be "almost right," not completely wrong. Soft targets with tau=200km give partial credit for nearby predictions.
 
 ---
 
 ## Pipeline
 
-### Stage 1: Contrastive Pretraining
-Align CLIP's image encoder to geographic text embeddings using synthetic captions ("A street view photo from Paris, France, in a temperate climate..."). Only DoRA adapter weights are trainable (0.13% of backbone). This gives the model a geographic prior before classification training.
+**Stage 1: Contrastive Pretraining** — Align CLIP's image encoder to geographic text embeddings using synthetic captions from GPS metadata. Only DoRA weights trainable (0.13% of backbone). Gives the model a geographic prior before classification.
 
-### Stage 2: Geocell Classification
-Classify images into semantic geocells using the geo head with haversine-smoothed soft targets. Auxiliary heads for scene type, climate zone, driving side, and UN region provide complementary geographic signals.
+**Stage 2: Geocell Classification** — Classify into semantic geocells with haversine-smoothed soft targets. Auxiliary heads for scene, climate, driving side, and UN region provide extra geographic signal.
 
-### Stage 3: FAISS Refinement
-Extract embeddings for all training images, build a FAISS index, and at inference time search within the top predicted cells' embeddings to find the nearest neighbor coordinate.
+**Stage 3: FAISS Refinement (deferred)** — Dense k-NN search over all training embeddings. Improved median from 672 to 605 km on Im2GPS3k but killed fine precision (<25km: 11.3% → 2.0%). Neighbor averaging blurs precise predictions. Deferred until 5M scale where density should actually help.
 
 ---
 
-## The Journey
+## What happened along the way
 
-### Phase 1: Infrastructure (Data Pipeline)
-Downloaded 50K images from OSV-5M spanning 213 countries. Built streaming pipeline with spatial density-balanced sampling to avoid European over-representation. Created S2 cell partitioning with haversine label smoothing.
+**Phase 1-2 (Data + S2 cells):** Downloaded 50K from OSV-5M across 213 countries. Trained 5 epochs on 8,970 S2 cells, hit 174 km internal val. Continent-level accuracy reached 92% fast, but the S2 cells were horribly imbalanced.
 
-### Phase 2: First Results (S2 Cells)
-Trained for 5 epochs (~3 hours on RTX 4060). Reached 174 km median on internal validation. The model learned geography surprisingly fast — continent-level accuracy (< 2500km) hit 92% by epoch 5. But the uniform S2 cells were horribly imbalanced.
+**Phase 3 (Semantic geocells + reality check):** OPTICS clustering brought cells down to 539, internal val improved to 130 km. Then we ran Im2GPS3k and got 672 km — 5.2x inflation from spatial leakage in our train/val split. That was a wake-up call. Implemented geographic block holdout (0.5° grid cells, 0% leakage) and made Im2GPS3k the only benchmark that matters.
 
-### Phase 3: Semantic Geocells + Honest Evaluation
-Replaced S2 cells with OPTICS-clustered semantic geocells. Internal metrics improved to 130 km median. Then came the reality check: **external Im2GPS3k benchmark showed 672 km** — a 5.2x inflation from spatial leakage in our train/val split. This was a pivotal moment. We implemented geographic train/val splitting (0.5° grid cells, 0% leakage) and accepted Im2GPS3k as the only honest benchmark.
+**Phase 4 (Analysis):** TTA (3 views) gave +0.9% — marginal. Per-continent breakdown showed Europe is strongest (328 km), North America is worst (1,266 km, only 1.8% <25km). Ran ablation study: more geocells (1424) + lower tau (100) = 617 km, best result at 50K.
 
-### Phase 4: Analysis & Refinement
-Test-time augmentation (3 views) gave a modest +0.9% improvement. Per-continent analysis revealed Europe is strongest (328 km median) and North America weakest (1,266 km) — likely because OSV-5M has denser European coverage. FAISS k-NN refinement improved the honest benchmark to 605 km.
-
-### Phase 5: 1M Scaling (In Progress)
-Downloaded 1M images across 222 countries. Built 971 semantic geocells (up from 539). Contrastive pretraining on 1M already improved: loss from 0.133 to 0.085, Geo-NN median from 891 km to 805 km. Classification training at 1M requires partial backbone unfreezing (57M params) on cloud A100 — estimated cost ~$15-25.
+**Phase 5 (1M scaling, in progress):** Downloaded 1M images (222 countries, density-balanced). Built 971 semantic geocells. Contrastive pretrain on 1M: loss dropped 36%. Classification training needs an A100 (~$15-25 for 12-18h). Code is ready, waiting on compute.
 
 ---
 
-## Lessons Learned
+## Challenges
 
-1. **Always audit train/val leakage before celebrating metrics.** Our internal val showed 130 km median; the honest external benchmark showed 672 km. The 38% of val images with a train neighbor < 1km completely invalidated internal metrics. Im2GPS3k became our only trusted benchmark.
+1. **Spatial leakage inflated everything.** Internal val said 130 km; Im2GPS3k said 672 km. 38% of val images had a train neighbor within 1 km. Switching to geographic block holdout and using Im2GPS3k as the only trusted metric was the single most important decision.
 
-2. **Semantic geocells >> uniform S2 cells.** OPTICS clustering reduced cells from 8,970 to 539 while eliminating the long tail of single-image cells. The improvement was immediate: +44 km median on internal val.
+2. **S2 cells don't work at 50K.** 39% of cells had one image. OPTICS semantic geocells fixed this — fewer cells (539 vs 8,970) with way better balance.
 
-3. **More epochs with early stopping, don't cut training short.** We initially ran 5 epochs. Extending to 15 with patience=3 found the best model at epoch 14. The model was still improving — patience prevents premature stopping without risking overfitting.
+3. **Training needs patience.** Initially ran 5 epochs. Going to 15 with early stopping found the best model at epoch 14. Still improving when we stopped.
 
-4. **k-NN refinement helps at scale but not at 50K.** Dense FAISS search improved median from 672 to 605 km, but fine-grained accuracy (< 25km) slightly degraded. With 1M images providing denser cell coverage, k-NN should shine. FAISS v2 deferred to 1M+.
+4. **FAISS doesn't help at 50K scale.** k-NN refined median from 672 to 605 km but destroyed city-level accuracy. At 50K the neighbor density is too sparse — averaging just adds noise. Deferred to 5M.
 
-5. **Domain gap is real.** The model trains on street-view imagery but Im2GPS3k contains Flickr tourist photos. A 672 km median on cross-domain data is actually within our architecture doc's target range (500-800 km) for 50K. The 1M run with backbone unfreezing should close this gap significantly.
+5. **Domain gap is real.** Training on street view, evaluating on Flickr tourist photos. 672 km on cross-domain data is within our architecture target (500-800 km) for 50K.
 
 ---
 
@@ -127,17 +151,17 @@ GEOPROJECT/
 ├── geoguessr/
 │   ├── data/
 │   │   ├── dataset.py              # PyTorch Dataset with CLIP preprocessing
-│   │   ├── download.py             # OSV-5M streaming & sampling
+│   │   ├── download.py             # OSV-5M streaming & density-balanced sampling
 │   │   ├── geocells.py             # S2 cell partitioning
 │   │   └── semantic_geocells.py    # OPTICS clustering + Voronoi
 │   ├── model/
 │   │   ├── geolocator.py           # Core model (CLIP + DoRA + heads)
 │   │   ├── contrastive.py          # Contrastive pretraining
-│   │   └── faiss_refinement.py     # Two-stage FAISS retrieval
+│   │   └── faiss_refinement.py     # Dense k-NN retrieval
 │   ├── train.py                    # Training loop
 │   ├── inference.py                # End-to-end inference
 │   └── eval_benchmark.py           # Im2GPS3k evaluation
-├── ARCHITECTURE.md                 # Detailed technical spec
+├── ARCHITECTURE.md                 # Full technical spec
 ├── SCALING_GUIDE.md                # Progress log & scaling notes
 ├── requirements.txt
 └── README.md
@@ -147,10 +171,10 @@ GEOPROJECT/
 
 ```bash
 # Clone
-git clone https://github.com/<your-username>/geolocator.git
+git clone https://github.com/VeerMalhotra8/geolocator.git
 cd geolocator
 
-# Install dependencies
+# Install
 pip install -r requirements.txt
 
 # Download data (50K subset of OSV-5M)
@@ -166,29 +190,28 @@ python -m geoguessr.model.contrastive --epochs 2 --batch-size 6 --accumulation 1
 python -m geoguessr.train --epochs 15 --batch-size 6 --accumulation 10 \
     --geocell-dir data/osv5m_50k/semantic_cells --patience 3
 
-# Evaluate on Im2GPS3k
+# Evaluate
 python -m geoguessr.eval_benchmark
 
-# Run inference on a single image
+# Inference
 python -m geoguessr.inference --image path/to/photo.jpg
 ```
 
 ## Hardware
 
-Developed and trained on:
-- **GPU:** NVIDIA RTX 4060 Laptop (8 GB VRAM, compute capability 8.9)
-- **Training:** bfloat16 mixed precision, gradient accumulation 10
-- **50K training time:** ~3 hours (classification), ~80 min (contrastive)
-- **1M training:** Requires A100 cloud instance (~$15-25 estimated)
+- **GPU:** NVIDIA RTX 4060 Laptop (8 GB VRAM)
+- **Training:** bfloat16, gradient accumulation 10
+- **50K time:** ~3h classification, ~80 min contrastive
+- **1M:** needs A100 (~$15-25)
 
 ## References
 
-- [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m) — OpenStreetView 5M dataset
+- [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m) — OpenStreetView 5M (CVPR 2024)
 - [PIGEON](https://arxiv.org/abs/2307.05845) — Predicting Image Geolocations (CVPR 2024)
 - [StreetCLIP](https://arxiv.org/abs/2302.00275) — CLIP for street-level geolocation
-- [GeoCLIP](https://arxiv.org/abs/2309.16020) — Clip-inspired alignment for geolocation (NeurIPS 2023)
+- [GeoCLIP](https://arxiv.org/abs/2309.16020) — CLIP-inspired alignment for geolocation (NeurIPS 2023)
 - [DoRA](https://arxiv.org/abs/2402.09353) — Weight-decomposed low-rank adaptation
 
 ## License
 
-This project is for educational and research purposes.
+For educational and research purposes.
