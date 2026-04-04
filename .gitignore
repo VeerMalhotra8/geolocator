@@ -1,0 +1,38 @@
+# Data & models (symlinked to D: drive, too large for git)
+/checkpoints/
+/data/
+/faiss_index/
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.log
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PDF reports (generated)
+*.pdf
