@@ -213,6 +213,25 @@ def load_checkpoint(model, optimizer, scheduler, path, device):
     return ckpt["epoch"], ckpt["global_step"]
 
 
+# ── MixUp ────────────────────────────────────────────────────────────
+
+def mixup_batch(images, smooth_targets, alpha):
+    """Apply MixUp to images and soft geo targets.
+
+    Samples λ ~ Beta(alpha, alpha), clamps to [0.5, 1.0] so dominant sample
+    stays >= 50%. Mixes images and soft targets; aux labels are left unchanged
+    (caller keeps sample-a's labels) to isolate the geo head effect.
+    """
+    assert alpha > 0, "mixup_batch requires alpha > 0"
+    lam = float(np.random.beta(alpha, alpha))
+    lam = max(lam, 1.0 - lam)  # keep lam >= 0.5
+
+    idx = torch.randperm(images.size(0), device=images.device)
+    mixed_images = lam * images + (1.0 - lam) * images[idx]
+    mixed_targets = lam * smooth_targets + (1.0 - lam) * smooth_targets[idx]
+    return mixed_images, mixed_targets
+
+
 # ── Training Loop ────────────────────────────────────────────────────
 
 def train(args):
@@ -225,7 +244,17 @@ def train(args):
 
     # Create data loaders
     print("Creating data loaders...")
+    data_dir = Path(args.data_dir)
+    # Use metadata_train.csv (geographic split, train-only) so smooth target
+    # indices (0..N_train-1) stay in bounds. metadata.csv includes val images
+    # which have no precomputed smooth targets.
+    metadata_path = data_dir / "metadata_train.csv"
+    if not metadata_path.exists():
+        metadata_path = data_dir / "metadata.csv"
+        print(f"  WARNING: metadata_train.csv not found, falling back to metadata.csv")
     train_loader, val_loader, num_cells = create_dataloaders(
+        metadata_path=str(metadata_path),
+        images_dir=str(data_dir / "images"),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         geocell_dir=args.geocell_dir,
@@ -292,6 +321,8 @@ def train(args):
     print(f"  Warmup: {args.warmup_steps} steps")
     print(f"  Total optimizer steps: {total_steps}")
     print(f"  Early stopping: patience={args.patience}")
+    if args.mixup_alpha > 0:
+        print(f"  MixUp: alpha={args.mixup_alpha} (Beta({args.mixup_alpha},{args.mixup_alpha}))")
     print(f"{'='*60}\n")
 
     model.train()
@@ -306,6 +337,9 @@ def train(args):
             images = images.to(device)
             smooth_targets = smooth_targets.to(device)
             aux_labels = {k: v.to(device) for k, v in aux_labels.items()}
+
+            if args.mixup_alpha > 0:
+                images, smooth_targets = mixup_batch(images, smooth_targets, args.mixup_alpha)
 
             with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                 outputs = model(images)
@@ -445,10 +479,18 @@ def main():
     parser.add_argument("--checkpoint-steps", type=int, default=1000)
     parser.add_argument("--checkpoint-dir", default="GEOPROJECT/checkpoints")
     parser.add_argument("--contrastive-checkpoint", default="GEOPROJECT/checkpoints/contrastive_best.pt")
-    parser.add_argument("--geocell-dir", type=str, default="GEOPROJECT/data/osv5m_50k",
-                        help="Directory with geocell config (S2 or semantic)")
+    parser.add_argument("--data-dir", type=str, default="GEOPROJECT/data/osv5m_50k",
+                        help="Directory with metadata.csv and images/")
+    parser.add_argument("--geocell-dir", type=str, default=None,
+                        help="Directory with geocell config (S2 or semantic). Defaults to data-dir")
+    parser.add_argument("--mixup-alpha", type=float, default=0.0,
+                        help="MixUp alpha for Beta(alpha,alpha). 0=disabled, 0.1=ablation D")
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
+
+    # Default geocell-dir to data-dir if not specified
+    if args.geocell_dir is None:
+        args.geocell_dir = args.data_dir
 
     train(args)
 
