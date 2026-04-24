@@ -350,6 +350,203 @@ def build_semantic_geocells_subsampled(
 build_semantic_geocells_fast = build_semantic_geocells
 
 
+def build_semantic_geocells_country_constrained(
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    countries: np.ndarray,
+    subsample_n: int = 500_000,
+    min_samples: int = 20,
+    max_eps: float = 0.0087,
+    min_cluster_size: int = None,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build semantic geocells with OPTICS run per-country so clusters never span borders.
+
+    Strategy:
+      1. Geographically stratified subsample (same as subsampled version)
+      2. For each country in subsample:
+           - >= min_samples points: run OPTICS, extract cluster centroids
+           - < min_samples points: single centroid at median lat/lon
+      3. Voronoi-assign all images to nearest centroid *within same country*
+         (fallback to global nearest for countries missing from subsample)
+
+    This ensures geocell boundaries respect country borders — road markings,
+    driving side, and language all change at borders, so this is semantically
+    meaningful (same motivation as PIGEOTTO's admin boundary approach).
+
+    Args:
+        latitudes: (N,) latitudes in degrees
+        longitudes: (N,) longitudes in degrees
+        countries: (N,) ISO country code strings
+        subsample_n: number of points for geographically stratified subsample
+        min_samples: OPTICS min_samples per country
+        max_eps: OPTICS max_eps in RADIANS (~0.0087 rad ≈ 50km)
+        min_cluster_size: minimum cluster size (default: min_samples)
+        seed: random seed for reproducibility
+
+    Returns:
+        cell_indices: (N,) array of integer cell labels (0-indexed)
+        centroids: (num_cells, 2) array of cell centroids [lat, lon] in degrees
+    """
+    if min_cluster_size is None:
+        min_cluster_size = min_samples
+
+    n = len(latitudes)
+    print(f"  Building country-constrained geocells: subsample {subsample_n:,} from {n:,} points...")
+
+    # ── Step 1: Geographically stratified subsample ───────────────────
+    rng = np.random.RandomState(seed)
+
+    if n <= subsample_n:
+        print(f"  Dataset smaller than subsample — using all {n:,} points")
+        sub_lats = latitudes
+        sub_lons = longitudes
+        sub_countries = countries
+    else:
+        print(f"  Creating geographically stratified subsample...")
+        t0 = time.time()
+
+        grid_lat = np.floor(latitudes).astype(np.int32)
+        grid_lon = np.floor(longitudes).astype(np.int32)
+        cell_keys = grid_lat * 1000 + grid_lon
+
+        unique_cells, cell_inverse = np.unique(cell_keys, return_inverse=True)
+        num_grid_cells = len(unique_cells)
+
+        base_per_cell = subsample_n // num_grid_cells
+        cell_counts = np.bincount(cell_inverse)
+        targets = np.minimum(cell_counts, base_per_cell)
+
+        deficit = subsample_n - targets.sum()
+        if deficit > 0:
+            headroom = cell_counts - targets
+            cells_with_room = np.where(headroom > 0)[0]
+            if len(cells_with_room) > 0:
+                total_headroom = headroom[cells_with_room].sum()
+                for ci in cells_with_room:
+                    extra = int(deficit * headroom[ci] / total_headroom) if total_headroom > 0 else 0
+                    extra = min(extra, headroom[ci])
+                    targets[ci] += extra
+
+        order = np.argsort(cell_inverse)
+        sorted_inverse = cell_inverse[order]
+        splits = np.searchsorted(sorted_inverse, np.arange(num_grid_cells + 1))
+
+        sub_indices_list = []
+        for ci in range(num_grid_cells):
+            cell_idx = order[splits[ci]:splits[ci + 1]]
+            n_take = min(int(targets[ci]), len(cell_idx))
+            if n_take > 0:
+                chosen = rng.choice(cell_idx, size=n_take, replace=False)
+                sub_indices_list.append(chosen)
+
+        sub_indices = np.concatenate(sub_indices_list)
+        sub_lats = latitudes[sub_indices]
+        sub_lons = longitudes[sub_indices]
+        sub_countries = countries[sub_indices]
+        print(f"  Subsample: {len(sub_indices):,} points from {num_grid_cells:,} grid cells "
+              f"({time.time()-t0:.1f}s)")
+
+    # ── Step 2: Per-country OPTICS ────────────────────────────────────
+    unique_sub_countries = np.unique(sub_countries)
+    print(f"  Running per-country OPTICS on {len(unique_sub_countries)} countries "
+          f"(min_samples={min_samples})...")
+    t0 = time.time()
+
+    all_centroids = []
+    all_centroid_countries = []
+    optics_countries = 0
+    fallback_countries = 0
+
+    for i, country in enumerate(unique_sub_countries):
+        mask = sub_countries == country
+        c_lats = sub_lats[mask]
+        c_lons = sub_lons[mask]
+        n_c = len(c_lats)
+
+        if n_c >= min_samples:
+            coords_rad = np.column_stack([np.radians(c_lats), np.radians(c_lons)])
+            optics = OPTICS(
+                min_samples=min_samples,
+                max_eps=max_eps,
+                metric="haversine",
+                cluster_method="xi",
+                min_cluster_size=min_cluster_size,
+                n_jobs=-1,
+            )
+            optics.fit(coords_rad)
+            raw_labels = optics.labels_
+
+            num_clusters = len(set(raw_labels.tolist())) - (1 if -1 in raw_labels else 0)
+
+            if num_clusters > 0:
+                country_centroids = _compute_centroids(raw_labels, c_lats, c_lons)
+                all_centroids.extend(country_centroids.tolist())
+                all_centroid_countries.extend([country] * len(country_centroids))
+                optics_countries += 1
+                if (i + 1) % 20 == 0 or n_c > 10_000:
+                    elapsed = time.time() - t0
+                    print(f"  [{i+1}/{len(unique_sub_countries)}] {country}: "
+                          f"{n_c:,} pts → {num_clusters} clusters ({elapsed:.0f}s elapsed)")
+                continue
+            else:
+                print(f"  WARNING: {country} has {n_c:,} subsample pts but OPTICS found 0 clusters "
+                      f"→ collapsing to single centroid (try increasing max_eps)")
+
+        # Fallback: single centroid at median position
+        all_centroids.append([float(np.median(c_lats)), float(np.median(c_lons))])
+        all_centroid_countries.append(country)
+        fallback_countries += 1
+
+    elapsed = time.time() - t0
+    print(f"  Per-country OPTICS done in {elapsed:.1f}s")
+    print(f"  OPTICS countries: {optics_countries}, single-centroid fallback: {fallback_countries}")
+
+    centroids_arr = np.array(all_centroids, dtype=np.float64)
+    centroid_countries_arr = np.array(all_centroid_countries)
+    print(f"  Total centroids discovered: {len(centroids_arr)}")
+
+    # ── Step 3: Country-constrained Voronoi assignment ─────────────────
+    # Build mapping: country → list of global centroid indices
+    country_centroid_map: dict[str, list[int]] = {}
+    for idx, c in enumerate(centroid_countries_arr):
+        country_centroid_map.setdefault(c, []).append(idx)
+
+    full_unique_countries = np.unique(countries)
+    missing = set(full_unique_countries.tolist()) - set(country_centroid_map.keys())
+    if missing:
+        print(f"  WARNING: {len(missing)} countries in full dataset have no subsample centroid "
+              f"→ using global nearest fallback: {sorted(missing)}")
+
+    print(f"  Country-constrained Voronoi assigning {n:,} points...")
+    t0 = time.time()
+    assignments = np.empty(n, dtype=np.int64)
+
+    for country in full_unique_countries:
+        mask = countries == country
+        cidx = country_centroid_map.get(country, None)
+
+        if cidx is None:
+            # Fallback: nearest centroid globally
+            cidx = list(range(len(centroids_arr)))
+
+        country_centroids = centroids_arr[cidx]
+        local_assignments = voronoi_assign_batched(
+            latitudes[mask], longitudes[mask], country_centroids
+        )
+        assignments[mask] = np.array(cidx, dtype=np.int64)[local_assignments]
+
+    print(f"  Voronoi assignment done in {time.time()-t0:.1f}s")
+
+    num_cells = len(centroids_arr)
+    unique_assigned, counts = np.unique(assignments, return_counts=True)
+    print(f"  Final: {num_cells} semantic geocells")
+    print(f"  Images per cell: min={counts.min()}, median={int(np.median(counts))}, "
+          f"max={counts.max()}, mean={counts.mean():.0f}")
+
+    return assignments, centroids_arr
+
+
 # ── Save / Load Semantic Geocell Config ───────────────────────────────
 
 def save_semantic_config(
@@ -419,6 +616,8 @@ def main():
                         help="Label smoothing temperature in km (use 100 for 2000+ cells)")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--country-aware", action="store_true",
+                        help="Run OPTICS per-country so clusters never span borders")
     args = parser.parse_args()
 
     import pandas as pd
@@ -428,6 +627,7 @@ def main():
     print(f"  min_samples: {args.min_samples}")
     print(f"  max_eps: {args.max_eps} rad ({np.degrees(args.max_eps):.2f} deg)")
     print(f"  tau: {args.tau} km, top-k: {args.top_k}")
+    print(f"  country-aware: {args.country_aware}")
     if args.subsample:
         print(f"  subsample: {args.subsample:,} (OPTICS on subsample, Voronoi-assign all)")
     else:
@@ -442,11 +642,35 @@ def main():
     lons = df["longitude"].values
     print(f"  {len(df):,} images")
     print(f"  WARNING: Ensure this is TRAIN-ONLY data to avoid leakage!")
+
+    # Drop NaN coordinates — OPTICS crashes on NaN input
+    nan_mask = np.isnan(lats) | np.isnan(lons)
+    if nan_mask.any():
+        print(f"  WARNING: Dropping {nan_mask.sum():,} rows with NaN lat/lon")
+        df = df[~nan_mask].reset_index(drop=True)
+        lats = df["latitude"].values
+        lons = df["longitude"].values
     print()
 
     # Build semantic geocells
     t0 = time.time()
-    if args.subsample and len(df) > args.subsample:
+    if args.country_aware:
+        if "country" not in df.columns:
+            raise ValueError("--country-aware requires a 'country' column in metadata CSV")
+        if args.subsample is None:
+            print(f"  WARNING: --country-aware without --subsample will run OPTICS on all "
+                  f"{len(df):,} points per country. This may be very slow or OOM on large datasets. "
+                  f"Consider adding --subsample 500000.")
+        country_codes = df["country"].fillna("XX").values.astype(str)
+        cell_indices, centroids = build_semantic_geocells_country_constrained(
+            lats, lons, country_codes,
+            subsample_n=args.subsample or len(df),
+            min_samples=args.min_samples,
+            max_eps=args.max_eps,
+            min_cluster_size=args.min_cluster_size,
+            seed=args.seed,
+        )
+    elif args.subsample and len(df) > args.subsample:
         cell_indices, centroids = build_semantic_geocells_subsampled(
             lats, lons,
             subsample_n=args.subsample,
@@ -471,6 +695,7 @@ def main():
         "max_eps": args.max_eps,
         "min_cluster_size": args.min_cluster_size or args.min_samples,
         "subsample": args.subsample,
+        "country_aware": args.country_aware,
     }
     save_semantic_config(args.output, centroids, cell_indices, args.tau, args.top_k, optics_params)
     print()
