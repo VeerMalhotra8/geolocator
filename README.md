@@ -4,7 +4,7 @@ Predicts where a photo was taken from pixels alone — no GPS, no EXIF, just the
 
 Uses CLIP ViT-L/14 with DoRA adapters and semantic geocell classification. Trained on 50K street-view images from [OSV-5M](https://huggingface.co/datasets/osv5m/osv5m), scaling to 1M next.
 
-**50K Im2GPS3k benchmark: 672 km median error**
+**Best Im2GPS3k result: 617 km median** (1424 geocells + tau=100, ablation C)
 
 ---
 
@@ -14,11 +14,11 @@ Uses CLIP ViT-L/14 with DoRA adapters and semantic geocell classification. Train
 
 | Metric | GeoLocator (50K) | StreetCLIP (1.1M) | Target (1M) |
 |--------|:---:|:---:|:---:|
-| Median error | 672 km | ~900 km* | 350-450 km |
-| < 25 km (city) | 11.3% | 22.4% | 18-22% |
-| < 200 km (region) | 23.1% | 37.4% | 38-45% |
-| < 750 km (country) | 52.8% | 61.3% | 68-75% |
-| < 2500 km (continent) | 77.6% | 80.4% | 88-92% |
+| Median error | **617 km** | ~900 km* | 350-450 km |
+| < 25 km (city) | 13.1% | 22.4% | 18-22% |
+| < 200 km (region) | 26.3% | 37.4% | 38-45% |
+| < 750 km (country) | 55.2% | 61.3% | 68-75% |
+| < 2500 km (continent) | 78.1% | 80.4% | 88-92% |
 
 *StreetCLIP doesn't report median directly; estimated from their % @ km curve.
 
@@ -46,7 +46,7 @@ Tested modifications before committing to the 1M run:
 | tau=100 only (539 cells) | 674 km | 12.2% | 24.0% | 52.2% | 77.0% | no change |
 | **1424 cells + tau=100** | **617 km** | **13.1%** | **26.3%** | **55.2%** | **78.1%** | **-8.2%, best** |
 | Hierarchical continent mask | 673 km | 11.3% | 23.2% | 52.5% | 77.6% | useless, dropped |
-| MixUp (beta=0.1) | — | — | — | — | — | never ran |
+| MixUp (beta=0.1) on Ablation C | 646 km | — | — | — | — | +29km regression, dropped |
 
 More geocells + lower tau was the clear winner. Tau alone does nothing — they're coupled. Continent masking was a waste — the geo head already concentrates probability on the right continent. MixUp was planned but we moved on to 1M.
 
@@ -126,7 +126,7 @@ CLIP ViT-L/14 (frozen, 428M params)
 
 **Phase 4 (Analysis):** TTA (3 views) gave +0.9% — marginal. Per-continent breakdown showed Europe is strongest (328 km), North America is worst (1,266 km, only 1.8% <25km). Ran ablation study: more geocells (1424) + lower tau (100) = 617 km, best result at 50K.
 
-**Phase 5 (1M scaling, in progress):** Downloaded 1M images (222 countries, density-balanced). Built 971 semantic geocells. Contrastive pretrain on 1M: loss dropped 36%. Classification training needs an A100 (~$15-25 for 12-18h). Code is ready, waiting on compute.
+**Phase 5 (1M scaling, in progress):** Downloaded 1M images (222 countries, density-balanced). Built 6,794 country-aware semantic geocells (v3, per-country OPTICS, no cross-border clusters). Contrastive pretrain on 1M: loss dropped 36% (0.1330 → 0.0847). Classification training needs an A100 (~$15-25 for 12-18h). Truncated image handling added to dataset.py. Code is ready, waiting on compute.
 
 ---
 
