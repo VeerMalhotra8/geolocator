@@ -8,6 +8,18 @@ Uses CLIP ViT-L/14 with DoRA adapters and semantic geocell classification. Train
 
 ---
 
+## Demo
+
+Input photo taken in **Manipal, India** — model predicted Kerala coast, **444 km error**.
+
+| Input Image | World View | Zoomed — India |
+|:---:|:---:|:---:|
+| ![Input](demo/bingbong.jpeg) | ![World](demo/Screenshot%202026-04-24%20135348.png) | ![India](demo/Screenshot%202026-04-24%20135402.png) |
+
+*🟢 Green pin = actual location (Manipal). 🔴 Red pin = model prediction. Dashed line = error distance.*
+
+---
+
 ## Results
 
 ### Im2GPS3k Benchmark (external, no leakage)
